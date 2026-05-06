@@ -1,0 +1,293 @@
+# ERPNext + MariaDB/Redis, PostgreSQL и Kafka для микросервисов, внешний nginx.
+# Тег образа: .env → ERPNEXT_TAG (по умолчанию v16.17.0).
+# ERPNext официально работает на MariaDB; PostgreSQL — для ваших сервисов.
+
+x-erpnext-img: &erpnext_img
+  image: ${ERPNEXT_IMAGE:-frappe/erpnext}:${ERPNEXT_TAG:-v16.17.0}
+  pull_policy: ${PULL_POLICY:-if_not_present}
+
+x-erpnext-app: &erpnext_app
+  <<: *erpnext_img
+  restart: unless-stopped
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+
+networks:
+  erpnext_net:
+    driver: bridge
+
+volumes:
+  db-data:
+  redis-queue-data:
+  sites:
+  logs:
+  postgres-data:
+  zookeeper-data:
+  kafka-data:
+
+services:
+  db:
+    image: mariadb:11.8
+    restart: unless-stopped
+    networks: [erpnext_net]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 30s
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+    volumes:
+      - db-data:/var/lib/mysql
+
+  redis-cache:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    networks: [erpnext_net]
+
+  redis-queue:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    networks: [erpnext_net]
+    volumes:
+      - redis-queue-data:/data
+
+  configurator:
+    <<: *erpnext_img
+    restart: on-failure
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    platform: linux/amd64
+    networks: [erpnext_net]
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host $$DB_HOST;
+        bench set-config -gp db_port $$DB_PORT;
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+        bench set-config -gp socketio_port $$SOCKETIO_PORT;
+        bench set-config -g chromium_path /usr/bin/chromium-headless-shell;
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: "9000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+
+  create-site:
+    <<: *erpnext_img
+    profiles: ["init"]
+    restart: "no"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    platform: linux/amd64
+    networks: [erpnext_net]
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - >
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        export start=`date +%s`;
+        until [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".db_host // empty"` ]] &&
+        [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_cache // empty"` ]] &&
+        [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_queue // empty"` ]]; do
+        echo "Waiting for sites/common_site_config.json to be created";
+        sleep 5;
+        if (( `date +%s`-start > 120 )); then
+        echo "could not find sites/common_site_config.json with required keys";
+        exit 1;
+        fi;
+        done;
+        echo "sites/common_site_config.json found";
+        if [ -f "sites/$$FRAPPE_SITE_NAME/site_config.json" ]; then
+        echo "Site $$FRAPPE_SITE_NAME already exists, skipping bench new-site";
+        exit 0;
+        fi;
+        bench new-site "$$FRAPPE_SITE_NAME" --mariadb-user-host-login-scope='%' --admin-password="$$FRAPPE_ADMIN_PASSWORD" --db-root-username=root --db-root-password="$$MYSQL_ROOT_PASSWORD" --install-app erpnext --set-default;
+    environment:
+      FRAPPE_SITE_NAME: ${FRAPPE_SITE_NAME}
+      FRAPPE_ADMIN_PASSWORD: ${FRAPPE_ADMIN_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  backend:
+    <<: *erpnext_app
+    platform: linux/amd64
+    networks: [erpnext_net]
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  websocket:
+    <<: *erpnext_app
+    platform: linux/amd64
+    networks: [erpnext_net]
+    command:
+      - node
+      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  frontend:
+    <<: *erpnext_app
+    platform: linux/amd64
+    networks: [erpnext_net]
+    command:
+      - nginx-entrypoint.sh
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$$host}
+      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
+      UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
+      UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
+      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-300}
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-100m}
+    depends_on:
+      - backend
+      - websocket
+
+  queue-short:
+    <<: *erpnext_app
+    platform: linux/amd64
+    networks: [erpnext_net]
+    command:
+      - bench
+      - worker
+      - --queue
+      - short,default
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  queue-long:
+    <<: *erpnext_app
+    platform: linux/amd64
+    networks: [erpnext_net]
+    command:
+      - bench
+      - worker
+      - --queue
+      - long,default,short
+    environment:
+      FRAPPE_REDIS_CACHE: redis://redis-cache:6379
+      FRAPPE_REDIS_QUEUE: redis://redis-queue:6379
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  scheduler:
+    <<: *erpnext_app
+    platform: linux/amd64
+    networks: [erpnext_net]
+    command:
+      - bench
+      - schedule
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [erpnext_net]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  zookeeper:
+    image: docker.io/bitnamilegacy/zookeeper:3.9
+    restart: unless-stopped
+    networks: [erpnext_net]
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+    volumes:
+      - zookeeper-data:/bitnami/zookeeper
+
+  kafka:
+    image: docker.io/bitnamilegacy/kafka:3.8
+    restart: unless-stopped
+    networks: [erpnext_net]
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/bitnami/kafka
+
+  marketplace:
+    build: ./services/marketplace
+    restart: unless-stopped
+    networks: [erpnext_net]
+
+  ozon:
+    build: ./services/ozon
+    restart: unless-stopped
+    networks: [erpnext_net]
+
+  factoring:
+    build: ./services/factoring
+    restart: unless-stopped
+    networks: [erpnext_net]
+
+  edge-nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    networks: [erpnext_net]
+    depends_on:
+      - frontend
+      - marketplace
+      - ozon
+      - factoring
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - /var/www/certbot:/var/www/certbot:ro
