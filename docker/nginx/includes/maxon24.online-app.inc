@@ -1,52 +1,3 @@
-# Прокси к ERPNext (frontend frappe) и маршруты к helper-сервисам.
-# После получения сертификатов раскомментируйте блок server для 443 и cert paths.
-
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    '' close;
-}
-
-upstream erpnext_frontend {
-    server frontend:8080;
-    keepalive 32;
-}
-
-upstream marketplace_upstream {
-    server marketplace:80;
-}
-
-upstream ozon_upstream {
-    server ozon:80;
-}
-
-upstream factoring_upstream {
-    server factoring:80;
-}
-
-server {
-    listen 80;
-    server_name maxon24.online www.maxon24.online erp.maxon24.online;
-
-    # Для ACME-челленджа certbot (webroot).
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-        allow all;
-    }
-
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    server_name maxon24.online www.maxon24.online erp.maxon24.online;
-
-    ssl_certificate /etc/letsencrypt/live/maxon24.online/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/maxon24.online/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers on;
-
     client_max_body_size 100m;
     proxy_read_timeout 300s;
     proxy_send_timeout 300s;
@@ -88,4 +39,3 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_pass http://factoring_upstream/;
     }
-}
