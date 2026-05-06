@@ -47,7 +47,16 @@ sudo certbot certonly --webroot -w /var/www/certbot \
   -d maxon24.online -d www.maxon24.online -d erp.maxon24.online
 ```
 
-После выпуска перезапустите контейнер `edge-nginx`.
+После выпуска перезапустите контейнер `edge-nginx` (или выполните в корне репозитория `./reload.sh` — он так же подхватит обновление конфигов с томов).
+
+## Скрипты перезапуска и сборки
+
+В каталоге **корня репозитория** (рядом с `run.sh`):
+
+| Файл | Действие |
+|------|----------|
+| [`../../reload.sh`](../../reload.sh) | Рестарт **всех** контейнеров в статусе `running`; `edge-nginx` перезапускается **последним**, чтобы заново резолвить upstream (`frontend`, `marketplace`, …) после их рестарта и поднять конфиг из `nginx/conf.d` и `nginx/includes`. |
+| [`../../rebuild.sh`](../../rebuild.sh) | `docker compose build` и `up -d --force-recreate` для выбранных сервисов с директивой `build` в compose. Флаги: `--marketplace`, `--ozon`, `--factoring`, `--all`. Опционально `--pull` (обновление образов из registry для остального стека) и `--no-edge` (не трогать edge-nginx после сборки). |
 
 ## Домены и Frappe
 
